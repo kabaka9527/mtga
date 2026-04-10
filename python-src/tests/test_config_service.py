@@ -3,9 +3,12 @@ from __future__ import annotations
 import unittest
 
 from modules.services.config_service import (
+    DEFAULT_HOSTS_DOMAIN,
     LEGACY_GROUP_MAPPED_MODEL_ID_WARNING,
     _collect_config_warnings,
     _normalize_config_group,
+    is_valid_hosts_domain,
+    normalize_hosts_domain,
 )
 
 
@@ -107,6 +110,21 @@ class ConfigGroupNormalizationTests(unittest.TestCase):
         )
 
         self.assertEqual(warnings, [])
+
+    def test_normalize_hosts_domain_uses_default_for_empty_value(self) -> None:
+        self.assertEqual(normalize_hosts_domain(""), DEFAULT_HOSTS_DOMAIN)
+
+    def test_normalize_hosts_domain_extracts_hostname_from_url(self) -> None:
+        self.assertEqual(
+            normalize_hosts_domain("https://api.example.com:443/v1/chat/completions"),
+            "api.example.com",
+        )
+
+    def test_hosts_domain_validation_accepts_standard_domain(self) -> None:
+        self.assertTrue(is_valid_hosts_domain("api.openai.com"))
+
+    def test_hosts_domain_validation_rejects_invalid_domain(self) -> None:
+        self.assertFalse(is_valid_hosts_domain("api openai com"))
 
 
 if __name__ == "__main__":

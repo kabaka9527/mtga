@@ -1,8 +1,32 @@
 <script setup lang="ts">
-type HostsAction = "modify" | "backup" | "restore" | "open";
+type HostsAction = "modify" | "backup" | "restore" | "open" | "save-domain";
 
 const store = useMtgaStore();
 const { runningAction, runAction } = usePendingAction<HostsAction>();
+const hostsDomain = computed({
+  get: () => store.hostsDomain.value,
+  set: (value) => {
+    store.hostsDomain.value = value;
+  },
+});
+
+const hostsDomainTooltip = [
+  "可自定义写入 hosts 的目标域名",
+  "默认：api.openai.com",
+  "修改 hosts 按钮会把该域名指向 127.0.0.1 与 ::1",
+].join("\n");
+
+const handleSaveDomain = async () => {
+  await runAction("save-domain", async () => {
+    const ok = await store.saveConfig();
+    if (ok) {
+      store.appendLog("hosts 域名设置已保存");
+    } else {
+      store.appendLog("hosts 域名设置保存失败");
+    }
+    return ok;
+  });
+};
 
 const handleModify = async () => {
   await runAction("modify", () => store.runHostsModify("add"));
@@ -25,9 +49,24 @@ const handleOpen = async () => {
   <div class="mtga-soft-panel space-y-3">
     <div>
       <div class="text-sm font-semibold text-slate-900">hosts 文件</div>
-      <div class="text-xs text-slate-500">快速修改与备份恢复</div>
+      <div class="text-xs text-slate-500">自定义域名映射、快速修改与备份恢复</div>
     </div>
     <div class="space-y-2">
+      <div
+        class="tooltip mtga-tooltip w-full"
+        :data-tip="hostsDomainTooltip"
+        style="--mtga-tooltip-max: 360px"
+      >
+        <MtgaInput v-model="hostsDomain" label="hosts 目标域名" placeholder="api.openai.com" />
+      </div>
+      <MtgaLoadingButton
+        class="mtga-btn-outline"
+        :loading="runningAction === 'save-domain'"
+        :disabled="Boolean(runningAction)"
+        @click="handleSaveDomain"
+      >
+        保存域名设置
+      </MtgaLoadingButton>
       <MtgaLoadingButton
         class="mtga-btn-primary"
         :loading="runningAction === 'modify'"

@@ -675,6 +675,44 @@ DNS.1 = api.openai.com
     return True
 
 
+def ensure_server_domain_config_files(
+    resource_manager: ResourceManager,
+    domain: str,
+    log_func: LogFunc = print,
+) -> bool:
+    """确保指定域名的服务器证书模板存在。"""
+    normalized_domain = domain.strip().lower()
+    if not normalized_domain:
+        log_func("服务器证书域名为空")
+        return False
+
+    san_config_path = resource_manager.get_config_file(f"{normalized_domain}.cnf")
+    subject_path = resource_manager.get_config_file(f"{normalized_domain}.subj")
+    template_files = {
+        san_config_path: (
+            "[ v3_req ]\n"
+            "basicConstraints = CA:FALSE\n"
+            "keyUsage = nonRepudiation, digitalSignature, keyEncipherment\n"
+            "subjectAltName = @alt_names\n\n"
+            "[alt_names]\n"
+            f"DNS.1 = {normalized_domain}\n"
+        ),
+        subject_path: f"/C=CN/ST=State/L=City/O=Organization/OU=Unit/CN={normalized_domain}",
+    }
+
+    for file_path, content in template_files.items():
+        if os.path.exists(file_path):
+            continue
+        try:
+            with open(file_path, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            log_func(f"创建域名证书模板: {file_path}")
+        except Exception as exc:  # noqa: BLE001
+            log_func(f"创建域名证书模板失败 {file_path}: {exc}")
+            return False
+    return True
+
+
 def _build_ca_certificate(
     private_key: rsa.RSAPrivateKey,
     *,

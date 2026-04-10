@@ -47,6 +47,8 @@ class ProxyServer:
     def start(self, host: str = "0.0.0.0", port: int = 443) -> bool:
         if not self.app_layer.valid:
             return False
+        cert_domain_obj = self.config.get("hosts_domain")
+        cert_domain = cert_domain_obj.strip() if isinstance(cert_domain_obj, str) else ""
 
         result = self.runtime.start(
             host=host,
@@ -55,6 +57,7 @@ class ProxyServer:
             custom_model_id=self.app_layer.custom_model_id,
             target_model_id=self.app_layer.target_model_id,
             stream_mode=self.app_layer.stream_mode,
+            cert_domain=cert_domain or None,
         )
         return result.ok
 

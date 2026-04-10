@@ -50,6 +50,41 @@ const LAZY_WARMUP_ERROR_HIDE_MS = 2200;
 const LAZY_WARMUP_MIN_VISIBLE_MS = 640;
 const LAZY_WARMUP_POLL_INTERVAL_MS = 220;
 const LAZY_WARMUP_POLL_TIMEOUT_MS = 15000;
+const DEFAULT_HOSTS_DOMAIN = "api.openai.com";
+const HOSTS_DOMAIN_PATTERN =
+  /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
+
+const normalizeHostsDomain = (value: unknown) => {
+  let normalized = "";
+  if (typeof value === "string") {
+    normalized = value.trim();
+  } else if (typeof value === "number") {
+    normalized = String(value);
+  }
+  if (!normalized) {
+    return DEFAULT_HOSTS_DOMAIN;
+  }
+
+  if (normalized.includes("://")) {
+    try {
+      const parsed = new URL(normalized);
+      if (parsed.hostname) {
+        normalized = parsed.hostname;
+      }
+    } catch {
+      // keep raw input for validation feedback
+    }
+  }
+
+  normalized = normalized.split("/", 1)[0]?.trim() || normalized;
+  const firstColon = normalized.indexOf(":");
+  if (firstColon > 0 && normalized.indexOf(":", firstColon + 1) === -1) {
+    normalized = normalized.slice(0, firstColon).trim();
+  }
+  return (normalized || DEFAULT_HOSTS_DOMAIN).toLowerCase();
+};
+
+const isValidHostsDomain = (value: string) => HOSTS_DOMAIN_PATTERN.test(value.trim().toLowerCase());
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -199,6 +234,8 @@ export const useMtgaStore = () => {
   const currentConfigIndex = useState<number>("mtga-current-config-index", () => 0);
   const mappedModelId = useState<string>("mtga-mapped-model-id", () => "");
   const mtgaAuthKey = useState<string>("mtga-auth-key", () => "");
+  const hostsDomain = useState<string>("mtga-hosts-domain", () => DEFAULT_HOSTS_DOMAIN);
+  const proxyRunning = useState<boolean>("mtga-proxy-running", () => false);
   const runtimeOptions = useState<RuntimeOptions>("mtga-runtime-options", () => ({
     ...DEFAULT_RUNTIME_OPTIONS,
   }));
@@ -767,6 +804,7 @@ export const useMtgaStore = () => {
     );
     mappedModelId.value = coerceText(result.mapped_model_id);
     mtgaAuthKey.value = coerceText(result.mtga_auth_key);
+    hostsDomain.value = normalizeHostsDomain(result.hosts_domain);
     if (Array.isArray(result.warnings)) {
       result.warnings.forEach((warning) => {
         const text = coerceText(warning).trim();
@@ -779,6 +817,12 @@ export const useMtgaStore = () => {
   };
 
   const saveConfig = async () => {
+    const normalizedHostsDomain = normalizeHostsDomain(hostsDomain.value);
+    if (!isValidHostsDomain(normalizedHostsDomain)) {
+      appendLog("保存配置失败：hosts 域名格式无效，请输入合法域名（示例：api.openai.com）");
+      return false;
+    }
+    hostsDomain.value = normalizedHostsDomain;
     const clampedIndex = clampIndex(currentConfigIndex.value, configGroups.value.length);
     currentConfigIndex.value = clampedIndex;
     const payload: ConfigPayload = {
@@ -786,6 +830,7 @@ export const useMtgaStore = () => {
       current_config_index: clampedIndex,
       mapped_model_id: coerceText(mappedModelId.value),
       mtga_auth_key: coerceText(mtgaAuthKey.value),
+      hosts_domain: normalizedHostsDomain,
     };
     const ok = await api.saveConfig(payload);
     return Boolean(ok);
@@ -874,6 +919,7 @@ export const useMtgaStore = () => {
       startLogStream();
       startProxyStepListener();
       startLazyWarmupListener();
+      void runProxyStatus({ silent: true });
       scheduleLazyWarmup();
       return;
     }
@@ -881,7 +927,12 @@ export const useMtgaStore = () => {
     startLogStream();
     startProxyStepListener();
     startLazyWarmupListener();
-    await Promise.all([loadAppInfo(), loadConfig(), loadStartupStatus()]);
+    await Promise.all([
+      loadAppInfo(),
+      loadConfig(),
+      loadStartupStatus(),
+      runProxyStatus({ silent: true }),
+    ]);
     scheduleLazyWarmup();
   };
 
@@ -911,7 +962,13 @@ export const useMtgaStore = () => {
   };
 
   const runHostsModify = async (mode: "add" | "backup" | "restore" | "remove") => {
-    const result = await api.hostsModify({ mode });
+    const normalizedHostsDomain = normalizeHostsDomain(hostsDomain.value);
+    if (!isValidHostsDomain(normalizedHostsDomain)) {
+      appendLog("hosts 操作失败：hosts 域名格式无效，请输入合法域名（示例：api.openai.com）");
+      return false;
+    }
+    hostsDomain.value = normalizedHostsDomain;
+    const result = await api.hostsModify({ mode, domain: normalizedHostsDomain });
     return applyInvokeResult(result, "hosts 操作");
   };
 
@@ -923,7 +980,13 @@ export const useMtgaStore = () => {
   const runProxyStart = async () => {
     const result = await api.proxyStart(buildProxyPayload());
     navigateProxyMissingConfigPanel(result?.message);
-    return applyInvokeResult(result, "启动代理服务器");
+    const ok = applyInvokeResult(result, "启动代理服务器");
+    if (ok) {
+      proxyRunning.value = true;
+    } else {
+      await runProxyStatus({ silent: true });
+    }
+    return ok;
   };
 
   const runProxyApplyCurrentConfig = async () => {
@@ -965,7 +1028,30 @@ export const useMtgaStore = () => {
 
   const runProxyStop = async () => {
     const result = await api.proxyStop();
-    return applyInvokeResult(result, "停止代理服务器");
+    const ok = applyInvokeResult(result, "停止代理服务器");
+    if (ok) {
+      proxyRunning.value = false;
+    } else {
+      await runProxyStatus({ silent: true });
+    }
+    return ok;
+  };
+
+  const runProxyStatus = async ({ silent = false }: { silent?: boolean } = {}) => {
+    const result = await api.proxyStatus();
+    if (!result) {
+      if (!silent) {
+        appendLog("获取代理状态失败：无法连接后端");
+      }
+      return false;
+    }
+    if (isRecord(result.details)) {
+      proxyRunning.value = result.details["running"] === true;
+    }
+    if (!result.ok && !silent) {
+      appendLog(result.message || "获取代理状态失败");
+    }
+    return result.ok;
   };
 
   const runProxyCheckNetwork = async () => {
@@ -985,7 +1071,13 @@ export const useMtgaStore = () => {
     }
     const result = await api.proxyStartAll(buildProxyPayload());
     navigateProxyMissingConfigPanel(result?.message);
-    return applyInvokeResult(result, "一键启动全部服务");
+    const ok = applyInvokeResult(result, "一键启动全部服务");
+    if (ok) {
+      proxyRunning.value = true;
+    } else {
+      await runProxyStatus({ silent: true });
+    }
+    return ok;
   };
 
   const runConfigGroupTest = async (index: number) => {
@@ -1144,6 +1236,8 @@ export const useMtgaStore = () => {
     currentConfigIndex,
     mappedModelId,
     mtgaAuthKey,
+    hostsDomain,
+    proxyRunning,
     runtimeOptions,
     logs,
     systemPrompts,
@@ -1183,6 +1277,7 @@ export const useMtgaStore = () => {
     runProxyStart,
     runProxyApplyCurrentConfig,
     runProxyStop,
+    runProxyStatus,
     runProxyCheckNetwork,
     runProxyStartAll,
     runConfigGroupTest,

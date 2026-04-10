@@ -64,6 +64,7 @@ export const useMtgaApi = () => {
     stream_mode?: string | null;
   }) => safeInvoke<InvokeResult>("proxy_apply_current_config", payload);
   const proxyStop = () => safeInvoke<InvokeResult>("proxy_stop");
+  const proxyStatus = () => safeInvoke<InvokeResult>("proxy_status");
   const proxyCheckNetwork = () => safeInvoke<InvokeResult>("proxy_check_network");
   const proxyStartAll = (payload: {
     debug_mode: boolean;
@@ -141,6 +142,7 @@ export const useMtgaApi = () => {
     proxyStart,
     proxyApplyCurrentConfig,
     proxyStop,
+    proxyStatus,
     proxyCheckNetwork,
     proxyStartAll,
     configGroupTest,

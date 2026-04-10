@@ -23,14 +23,22 @@ from modules.services.cert_service import (
     check_existing_ca_cert,
     clear_ca_cert_result,
     generate_certificates_result,
+    generate_server_certificate_result,
     install_ca_cert_result,
+    remove_server_certificate_result,
 )
-from modules.services.config_service import ConfigStore
+from modules.services.config_service import (
+    DEFAULT_HOSTS_DOMAIN,
+    ConfigStore,
+    is_valid_hosts_domain,
+    normalize_hosts_domain,
+)
 from modules.services.hosts_service import modify_hosts_file_result
 
 from .common import build_result_payload, collect_logs
 
 type LogFunc = Callable[[str], None]
+_hosts_domain_state = {"last_active": DEFAULT_HOSTS_DOMAIN}
 
 
 class ProxyStartPayload(BaseModel):
@@ -78,6 +86,69 @@ def _get_proxy_instance() -> Any | None:
     return _get_proxy_state().proxy_instance
 
 
+def _resolve_hosts_domain(*, log_func: LogFunc) -> str | None:
+    configured_domain = _get_config_store().load_hosts_domain()
+    normalized_domain = normalize_hosts_domain(configured_domain)
+    if not is_valid_hosts_domain(normalized_domain):
+        log_func("❌ hosts 域名格式无效，请在 hosts 页面填写合法域名后重试")
+        return None
+    return normalized_domain
+
+
+def _get_hosts_remove_domain(*, log_func: LogFunc) -> str | None:
+    runtime_domain = normalize_hosts_domain(_hosts_domain_state["last_active"])
+    if runtime_domain != DEFAULT_HOSTS_DOMAIN and is_valid_hosts_domain(runtime_domain):
+        return runtime_domain
+    configured_domain = _resolve_hosts_domain(log_func=log_func)
+    if configured_domain is not None:
+        return configured_domain
+    return runtime_domain if is_valid_hosts_domain(runtime_domain) else None
+
+
+def _prepare_runtime_server_cert(*, log_func: LogFunc) -> tuple[str | None, OperationResult]:
+    hosts_domain = _resolve_hosts_domain(log_func=log_func)
+    if hosts_domain is None:
+        return None, OperationResult.failure("hosts 域名格式无效")
+    _hosts_domain_state["last_active"] = hosts_domain
+
+    if hosts_domain == DEFAULT_HOSTS_DOMAIN:
+        return hosts_domain, OperationResult.success(domain=hosts_domain)
+
+    log_func(f"正在为自定义 hosts 域名生成服务器证书: {hosts_domain}")
+    result = generate_server_certificate_result(
+        domain=hosts_domain,
+        log_func=log_func,
+    )
+    if not result.ok:
+        return hosts_domain, OperationResult.failure(
+            result.message or "生成服务器证书失败",
+            code=result.code,
+        )
+    return hosts_domain, OperationResult.success(domain=hosts_domain)
+
+
+def _cleanup_runtime_server_cert(
+    *,
+    log_func: LogFunc,
+    domain: str | None = None,
+) -> OperationResult:
+    target_domain = (
+        normalize_hosts_domain(domain)
+        if isinstance(domain, str) and domain.strip()
+        else _get_hosts_remove_domain(log_func=log_func)
+    )
+    if target_domain is None:
+        return OperationResult.failure("hosts 域名格式无效")
+    if target_domain == DEFAULT_HOSTS_DOMAIN:
+        return OperationResult.success(domain=target_domain)
+
+    return remove_server_certificate_result(
+        domain=target_domain,
+        remove_templates=True,
+        log_func=log_func,
+    )
+
+
 def stop_proxy_for_shutdown(*, log_func: LogFunc | None = None) -> OperationResult:
     effective_log: LogFunc
     if log_func is None:
@@ -100,9 +171,20 @@ def stop_proxy_for_shutdown(*, log_func: LogFunc | None = None) -> OperationResu
         reason="shutdown",
         show_idle_message=True,
     )
-    hosts_result = modify_hosts_file_result(action="remove", log_func=_log)
+    remove_domain = _get_hosts_remove_domain(log_func=_log)
+    hosts_result = (
+        OperationResult.failure("hosts 域名格式无效")
+        if remove_domain is None
+        else modify_hosts_file_result(domain=remove_domain, action="remove", log_func=_log)
+    )
     if not hosts_result.ok:
         _log(f"⚠️ {hosts_result.message or 'hosts 条目清理失败'}")
+    cert_cleanup_result = _cleanup_runtime_server_cert(
+        log_func=_log,
+        domain=remove_domain,
+    )
+    if not cert_cleanup_result.ok:
+        _log(f"⚠️ {cert_cleanup_result.message or '自定义域名证书清理失败'}")
     return result
 
 
@@ -128,9 +210,17 @@ def _start_proxy_instance_result(
     success_message: str = "✅ 代理服务器启动成功",
     hosts_modified: bool = False,
 ) -> OperationResult:
+    hosts_domain, cert_prepare_result = _prepare_runtime_server_cert(log_func=log_func)
+    if not cert_prepare_result.ok:
+        return cert_prepare_result
+
+    runtime_config = dict(config)
+    if isinstance(hosts_domain, str) and hosts_domain.strip():
+        runtime_config["hosts_domain"] = hosts_domain
+
     state = _get_proxy_state()
-    return proxy_orchestration.start_proxy_instance_result(
-        config=config,
+    start_result = proxy_orchestration.start_proxy_instance_result(
+        config=runtime_config,
         deps=proxy_orchestration.StartProxyDeps(
             log=log_func,
             thread_manager=state.thread_manager,
@@ -142,6 +232,18 @@ def _start_proxy_instance_result(
         success_message=success_message,
         hosts_modified=hosts_modified,
     )
+    if (
+        not start_result.ok
+        and isinstance(hosts_domain, str)
+        and hosts_domain != DEFAULT_HOSTS_DOMAIN
+    ):
+        cleanup_result = _cleanup_runtime_server_cert(
+            log_func=log_func,
+            domain=hosts_domain,
+        )
+        if not cleanup_result.ok:
+            log_func(f"⚠️ {cleanup_result.message or '自定义域名证书清理失败'}")
+    return start_result
 
 
 def _restart_proxy_result(
@@ -223,7 +325,26 @@ def _build_proxy_config_silent(payload: ProxyStartPayload) -> dict[str, Any] | N
 
 
 def _modify_hosts_file(*, log_func: LogFunc, **kwargs: Any) -> OperationResult:
-    return modify_hosts_file_result(log_func=log_func, **kwargs)
+    params = dict(kwargs)
+    params.pop("domain", None)
+    action = params.get("action")
+    if action == "remove":
+        remove_domain = _get_hosts_remove_domain(log_func=log_func)
+        if remove_domain is None:
+            return OperationResult.failure("hosts 域名格式无效")
+        result = modify_hosts_file_result(domain=remove_domain, log_func=log_func, **params)
+        if result.ok:
+            _hosts_domain_state["last_active"] = remove_domain
+        return result
+
+    hosts_domain = _resolve_hosts_domain(log_func=log_func)
+    if hosts_domain is None:
+        return OperationResult.failure("hosts 域名格式无效")
+
+    result = modify_hosts_file_result(domain=hosts_domain, log_func=log_func, **params)
+    if result.ok:
+        _hosts_domain_state["last_active"] = hosts_domain
+    return result
 
 
 def _push_proxy_step(
@@ -410,7 +531,7 @@ def _proxy_start_all_cert(log_func: LogFunc) -> OperationResult | None:
 def _proxy_start_all_hosts(log_func: LogFunc) -> OperationResult | None:
     _push_proxy_step(log_func, step="hosts", status="started")
     log_func("步骤 3/4: 修改hosts文件")
-    hosts_result = modify_hosts_file_result(log_func=log_func)
+    hosts_result = _modify_hosts_file(log_func=log_func)
     if not hosts_result.ok:
         _push_proxy_step(
             log_func,
@@ -512,9 +633,16 @@ async def proxy_stop() -> dict[str, Any]:
         log=log_func,
         show_idle_message=True,
     )
-    hosts_result = modify_hosts_file_result(action="remove", log_func=log_func)
+    remove_domain = _get_hosts_remove_domain(log_func=log_func)
+    hosts_result = _modify_hosts_file(log_func=log_func, action="remove")
     if not hosts_result.ok:
         log_func(f"⚠️ {hosts_result.message or 'hosts 条目清理失败'}")
+    cert_cleanup_result = _cleanup_runtime_server_cert(
+        log_func=log_func,
+        domain=remove_domain,
+    )
+    if not cert_cleanup_result.ok:
+        log_func(f"⚠️ {cert_cleanup_result.message or '自定义域名证书清理失败'}")
     return build_result_payload(result, logs, "代理服务器停止完成")
 
 
@@ -529,6 +657,14 @@ async def proxy_check_network() -> dict[str, Any]:
         )
     result = OperationResult.success(report=report)
     return build_result_payload(result, logs, "网络环境检查完成")
+
+
+async def proxy_status() -> dict[str, Any]:
+    logs: list[str] = []
+    instance = _get_proxy_instance()
+    running = bool(instance and instance.is_running())
+    result = OperationResult.success(running=running)
+    return build_result_payload(result, logs, "代理状态获取完成")
 
 
 async def proxy_start_all(body: ProxyStartPayload) -> dict[str, Any]:
@@ -567,4 +703,5 @@ def register_proxy_commands(commands: Commands) -> None:
     commands.set_command("proxy_apply_current_config", proxy_apply_current_config)
     commands.set_command("proxy_stop", proxy_stop)
     commands.set_command("proxy_check_network", proxy_check_network)
+    commands.set_command("proxy_status", proxy_status)
     commands.set_command("proxy_start_all", proxy_start_all)

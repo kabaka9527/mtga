@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -13,6 +15,10 @@ from modules.proxy.proxy_config import (
 )
 
 DEFAULT_PROVIDER = OPENAI_CHAT_COMPLETION_PROVIDER
+DEFAULT_HOSTS_DOMAIN = "api.openai.com"
+HOSTS_DOMAIN_PATTERN = re.compile(
+    r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$"
+)
 # Breaking change:
 # `config_groups[*].mapped_model_id` 已经不符合当前“一份全局映射模型ID + 多个配置组”的语义。
 # 新版本不会自动迁移该字段；读取时会直接忽略，保存时会按当前 schema 清理掉。
@@ -34,6 +40,32 @@ CONFIG_GROUP_ALLOWED_KEYS = frozenset(
         "prompt_cache_enabled",
     }
 )
+
+
+def normalize_hosts_domain(raw_domain: Any) -> str:
+    if not isinstance(raw_domain, str):
+        return DEFAULT_HOSTS_DOMAIN
+
+    normalized = raw_domain.strip()
+    if not normalized:
+        return DEFAULT_HOSTS_DOMAIN
+
+    if "://" in normalized:
+        parsed = urlsplit(normalized)
+        if parsed.hostname:
+            normalized = parsed.hostname
+
+    normalized = normalized.split("/", 1)[0].strip()
+    if normalized.count(":") == 1:
+        normalized = normalized.split(":", 1)[0].strip()
+    return normalized.lower()
+
+
+def is_valid_hosts_domain(domain: str) -> bool:
+    normalized = domain.strip().lower()
+    if not normalized:
+        return False
+    return HOSTS_DOMAIN_PATTERN.fullmatch(normalized) is not None
 
 
 def _normalize_config_group(raw_group: Any) -> dict[str, Any] | None:
@@ -134,12 +166,24 @@ class ConfigStore:
             pass
         return "", ""
 
+    def load_hosts_domain(self) -> str:
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, encoding="utf-8") as f:
+                    config = yaml.safe_load(f)
+                    if config:
+                        return normalize_hosts_domain(config.get("hosts_domain"))
+        except Exception:
+            pass
+        return DEFAULT_HOSTS_DOMAIN
+
     def save_config_groups(
         self,
         config_groups: list[dict[str, Any]],
         current_index: int = 0,
         mapped_model_id: str | None = None,
         mtga_auth_key: str | None = None,
+        hosts_domain: str | None = None,
     ) -> bool:
         try:
             config_data: dict[str, Any] = {}
@@ -160,6 +204,8 @@ class ConfigStore:
                 config_data["mapped_model_id"] = mapped_model_id
             if mtga_auth_key is not None:
                 config_data["mtga_auth_key"] = mtga_auth_key
+            if hosts_domain is not None:
+                config_data["hosts_domain"] = normalize_hosts_domain(hosts_domain)
 
             os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
 

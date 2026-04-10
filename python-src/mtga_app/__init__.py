@@ -208,6 +208,7 @@ class SaveConfigPayload(BaseModel):
     current_config_index: int
     mapped_model_id: str | None = None
     mtga_auth_key: str | None = None
+    hosts_domain: str | None = None
 
 
 @lru_cache(maxsize=1)
@@ -233,12 +234,14 @@ async def load_config() -> dict[str, Any]:
     config_store = _get_config_store()
     config_groups, current_index = config_store.load_config_groups()
     mapped_model_id, mtga_auth_key = config_store.load_global_config()
+    hosts_domain = config_store.load_hosts_domain()
     warnings = config_store.load_config_warnings()
     return {
         "config_groups": config_groups,
         "current_config_index": current_index,
         "mapped_model_id": mapped_model_id,
         "mtga_auth_key": mtga_auth_key,
+        "hosts_domain": hosts_domain,
         "warnings": warnings,
     }
 
@@ -251,6 +254,7 @@ async def save_config(body: SaveConfigPayload) -> bool:
         body.current_config_index,
         body.mapped_model_id,
         body.mtga_auth_key,
+        body.hosts_domain,
     )
 
 

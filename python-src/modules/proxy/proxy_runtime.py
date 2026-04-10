@@ -194,6 +194,7 @@ class ProxyRuntime:
         custom_model_id: str,
         target_model_id: str,
         stream_mode: str | None,
+        cert_domain: str | None = None,
     ) -> OperationResult:
         if self._state.running:
             self._log("代理服务器已在运行")
@@ -203,8 +204,9 @@ class ProxyRuntime:
             self._log("Flask 应用未初始化")
             return OperationResult.failure("Flask 应用未初始化")
 
-        cert_file = self._resource_manager.get_cert_file()
-        key_file = self._resource_manager.get_key_file()
+        effective_cert_domain = cert_domain.strip() if isinstance(cert_domain, str) else ""
+        cert_file = self._resource_manager.get_cert_file(effective_cert_domain or "api.openai.com")
+        key_file = self._resource_manager.get_key_file(effective_cert_domain or "api.openai.com")
 
         if not cert_file or not key_file:
             self._log("证书路径为空")
@@ -223,6 +225,8 @@ class ProxyRuntime:
             self._log(f"目标 API 地址: {target_api_base_url}")
             self._log(f"自定义模型 ID: {custom_model_id}")
             self._log(f"实际模型 ID: {target_model_id}")
+            if effective_cert_domain:
+                self._log(f"TLS 证书域名: {effective_cert_domain}")
             if stream_mode:
                 self._log(f"强制流模式: {stream_mode}")
 
